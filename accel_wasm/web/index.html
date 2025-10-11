@@ -59,6 +59,8 @@
       <div>X / Y / Z (m/s²)</div><div id="kvXYZ">–</div>
       <div>|a| (m/s²)</div><div id="kvMag">–</div>
       <div>Last line</div><div id="kvLine" class="muted">–</div>
+      <p id="motionStatus" class="live warn" style="margin-top:0.75rem;">No motion</p>
+
     </div>
   </div>
 
@@ -95,126 +97,124 @@
       statusEl.textContent = text;
       statusEl.className = `live ${cls || ""}`;
     }
+function setMotion(active) {
+  const el = document.getElementById("motionStatus");
+  if (active) {
+    el.textContent = "Motion Detected";
+    el.className = "live err";
+  } else {
+    el.textContent = "No motion";
+    el.className = "live ok";
+  }
+}
 
     // ---------- Canvas helpers ----------
-    function setupHiDPICanvas(canvas) {
-      const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.floor(rect.width * dpr);
-      canvas.height = Math.floor(rect.height * dpr);
-      const ctx = canvas.getContext("2d");
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      return ctx;
+function setupHiDPICanvas(canvas) {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return ctx;
+}
+
+class StripChart {
+  constructor(canvas, series, yRange) {
+    this.canvas = canvas;
+    this.ctx = setupHiDPICanvas(canvas);
+    this.series = series;
+    this.capacity = 600;
+    this.yMin = yRange?.min ?? 0;
+    this.yMax = yRange?.max ?? 20;
+    this.smoothFactor = 0.25; // slower autoscale smoothing
+    this._raf = null;
+    this._needsRedraw = true;
+    this.start();
+    window.addEventListener("resize", () => {
+      this.ctx = setupHiDPICanvas(canvas);
+      this._needsRedraw = true;
+    });
+  }
+  push(values) {
+    for (let i = 0; i < this.series.length; i++) {
+      const s = this.series[i];
+      if (!s.data) {
+        s.data = new Float64Array(this.capacity);
+        s.head = 0;
+      }
+      s.data[s.head % this.capacity] = values[i] ?? 0;
+    }
+    const head = (this.series[0].head + 1) % this.capacity;
+    for (const s of this.series) s.head = head;
+    this._needsRedraw = true;
+  }
+  autoscale(pad = 0.1) {
+    let lo = +Infinity, hi = -Infinity;
+    for (const s of this.series) {
+      if (!s.data) continue;
+      for (const v of s.data) {
+        if (!Number.isFinite(v)) continue;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+      }
+    }
+    if (lo === +Infinity) return;
+    const span = Math.max(1e-6, hi - lo);
+    const newMin = lo - span * pad;
+    const newMax = hi + span * pad;
+    // Smooth transition
+    this.yMin += (newMin - this.yMin) * this.smoothFactor;
+    this.yMax += (newMax - this.yMax) * this.smoothFactor;
+  }
+  draw() {
+    if (!this._needsRedraw) return;
+    const { ctx, canvas } = this;
+    const W = canvas.clientWidth, H = canvas.clientHeight;
+    ctx.clearRect(0, 0, W, H);
+
+    // Grid lines
+    ctx.strokeStyle = "#e5e7eb";
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 5; i++) {
+      const y = (H * i) / 5;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
     }
 
-    class StripChart {
-      constructor(canvas, series, yRange) {
-        this.canvas = canvas;
-        this.ctx = setupHiDPICanvas(canvas);
-        this.series = series;  // [{name, color, data: Float64Array, head, visible}]
-        this.capacity = 600;   // samples stored
-        this.yMin = yRange?.min ?? 0;
-        this.yMax = yRange?.max ?? 20; // default ~2g
-        this._raf = null;
-        this._needsRedraw = true;
-        window.addEventListener("resize", () => {
-          this.ctx = setupHiDPICanvas(canvas);
-          this._needsRedraw = true;
-          this.draw();
-        });
+    const head = this.series[0].head ?? 0;
+    const cap  = this.capacity;
+    const xStep = W / (cap - 1);
+    const toY = (v) => H - ((v - this.yMin) / (this.yMax - this.yMin)) * H;
+
+    for (const s of this.series) {
+      if (s.visible === false || !s.data) continue;
+      ctx.beginPath();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = s.color;
+      for (let i = 0; i < cap; i++) {
+        const idx = (head + i + 1) % cap;
+        const x = i * xStep;
+        const y = toY(s.data[idx]);
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
       }
-      push(values) {
-        // values is array aligned to series
-        for (let i = 0; i < this.series.length; i++) {
-          const s = this.series[i];
-          if (!s.data) {
-            s.data = new Float64Array(this.capacity);
-            s.head = 0;
-          }
-          s.data[s.head % this.capacity] = values[i] ?? 0;
-        }
-        // advance head once (all share same head)
-        this.series[0].head = (this.series[0].head + 1) % this.capacity;
-        for (let i = 1; i < this.series.length; i++) this.series[i].head = this.series[0].head;
-        this._needsRedraw = true;
-      }
-      autoscale(pad = 0.1) {
-        let lo = +Infinity, hi = -Infinity;
-        for (const s of this.series) {
-          if (!s.visible) continue;
-          const arr = s.data; if (!arr) continue;
-          for (let i = 0; i < arr.length; i++) {
-            const v = arr[i];
-            if (!Number.isFinite(v)) continue;
-            if (v < lo) lo = v;
-            if (v > hi) hi = v;
-          }
-        }
-        if (lo === +Infinity) return;
-        const span = Math.max(1e-6, hi - lo);
-        this.yMin = lo - span * pad;
-        this.yMax = hi + span * pad;
-        this._needsRedraw = true;
-      }
-      draw() {
-        if (!this._needsRedraw) return;
-        const { ctx, canvas } = this;
-        const W = canvas.clientWidth, H = canvas.clientHeight;
-        ctx.clearRect(0, 0, W, H);
-
-        // grid
-        ctx.save();
-        ctx.strokeStyle = "#eee";
-        ctx.lineWidth = 1;
-        for (let i = 1; i < 5; i++) {
-          const y = (H * i) / 5;
-          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-        }
-        ctx.restore();
-
-        const head = this.series[0].head ?? 0;
-        const cap  = this.capacity;
-        const xStep = W / (cap - 1);
-        const toY = (v) => {
-          const t = (v - this.yMin) / (this.yMax - this.yMin);
-          return H - t * H;
-        };
-
-        for (const s of this.series) {
-          if (s.visible === false) continue;
-          const arr = s.data; if (!arr) continue;
-
-          ctx.beginPath();
-          ctx.lineWidth = 2;
-          ctx.strokeStyle = s.color;
-          // ring buffer draw
-          for (let i = 0; i < cap; i++) {
-            const idx = (head + i + 1) % cap;
-            const x = i * xStep;
-            const y = toY(arr[idx]);
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
-          }
-          ctx.stroke();
-        }
-
-        // y-axis min/max
-        ctx.fillStyle = "#666";
-        ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, Arial";
-        ctx.fillText(this.yMax.toFixed(1), 6, 12);
-        ctx.fillText(this.yMin.toFixed(1), 6, H - 6);
-
-        this._needsRedraw = false;
-      }
-      start() {
-        const tick = () => {
-          this._raf = requestAnimationFrame(tick);
-          this.draw();
-        };
-        if (!this._raf) this._raf = requestAnimationFrame(tick);
-      }
-      stop() { if (this._raf) cancelAnimationFrame(this._raf); this._raf = null; }
+      ctx.stroke();
     }
+
+    ctx.fillStyle = "#444";
+    ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    ctx.fillText(this.yMax.toFixed(1), 6, 12);
+    ctx.fillText(this.yMin.toFixed(1), 6, H - 6);
+    this._needsRedraw = false;
+  }
+  start() {
+    const tick = () => {
+      this._raf = requestAnimationFrame(tick);
+      this.draw();
+    };
+    this._raf = requestAnimationFrame(tick);
+  }
+}
 
     // ---------- Charts ----------
     const chartMag = new StripChart(
@@ -240,7 +240,7 @@
     // ---------- WASM + Serial ----------
     await init();
     // alpha=0.10, threshold=0.5 m/s² (~0.05g)
-    const det = new Detector(0.10, 0.5);
+    const det = new Detector(0.10, 1.0);
 
     let port = null, reader = null;
 
@@ -351,14 +351,18 @@
         const mag = out[3], ema = out[4], alarm = !!out[5];
 
         // Live readout
-        kvXYZ.textContent = `${ax.toFixed(3)}, ${ay.toFixed(3)}, ${az.toFixed(3)}`;
-        kvMag.textContent = `${mag.toFixed(3)}`;
-        kvEMA.textContent = `${ema.toFixed(3)}`;
-        setStatus(alarm ? "Connected (ALARM)" : "Connected", alarm ? "err" : "ok");
+kvXYZ.textContent = `${ax.toFixed(3)}, ${ay.toFixed(3)}, ${az.toFixed(3)}`;
+kvMag.textContent = `${mag.toFixed(3)}`;
+kvEMA.textContent = `${ema.toFixed(3)}`;
+setStatus(alarm ? "Connected (ALARM)" : "Connected", alarm ? "err" : "ok");
 
-        // Push to charts
-        chartMag.push([mag, ema]);
-        chartXYZ.push([ax, ay, az]);
+// Motion detection threshold ±0.5 m/s²
+const motion = (Math.abs(ax) > 1.0) || (Math.abs(ay) > 1.0);
+setMotion(motion);
+
+chartMag.push([mag, ema]);
+chartXYZ.push([ax, ay, az]);
+
 
         // Optional autoscale (comment out to fix range)
         chartMag.autoscale(0.15);
