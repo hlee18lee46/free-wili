@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Theft Detection Gate Sensor WASM Dashboard powered by FREE-WILi WebAssembly, WebSerial</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --card-border:#e5e7eb; --bg:#fff; --grid:#f3f4f6; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; background:#fafafa; color:#111; }
+  .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  .btn { padding: .7rem 1.1rem; border-radius: .6rem; border: 1px solid #bbb; cursor: pointer; background:#fff; }
+  .btn:hover { background:#f9fafb; }
+  .live { font-weight: 700; }
+  .ok { color: #1a7f37; }
+  .warn { color: #b54708; }
+  .err { color: #b42318; }
+  .kv { display: grid; grid-template-columns: 10rem 1fr; gap: .4rem 1rem; margin-top: 1rem; }
+  .card { border: 1px solid var(--card-border); border-radius: .75rem; padding: 1rem; margin-top: 1rem; background:var(--bg); box-shadow: 0 2px 6px rgba(0,0,0,0.05); }
+  .muted { color: #666; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .charts { display: grid; gap: 1rem; grid-template-columns: 1fr; }
+  canvas { width: 100%; height: 300px; display: block; border: 1px solid var(--card-border); border-radius: .5rem; background: #fff; }
+  @media (min-width: 900px) { .charts { grid-template-columns: 1fr 1fr; } }
+  .legend { font-size: .9rem; color: #444; margin-bottom: .25rem; }
+  .legend b { font-weight: 700; }
+</style>
+
+</head>
+<body>
+  <h1>Theft Detection Gate Sensor Dashboard powered by FREE-WILi WebAssembly, WebSerial</h1>
+  <p class="muted">Connect directly to your FREE-WILi via WebSerial and process motion in WebAssembly (Rust → wasm-bindgen).</p>
+
+  <div class="row" style="margin:1rem 0">
+    <button id="connectBtn" class="btn">Connect Device</button>
+    <button id="disconnectBtn" class="btn" disabled>Disconnect</button>
+    <label>Baud:
+      <select id="baud">
+        <option value="115200" selected>115200</option>
+        <option value="57600">57600</option>
+        <option value="38400">38400</option>
+        <option value="9600">9600</option>
+      </select>
+    </label>
+    <label>g_range:
+      <select id="grange">
+        <option value="16384" selected>16384 (±2g)</option>
+        <option value="8192">8192 (±4g)</option>
+        <option value="4096">4096 (±8g)</option>
+        <option value="2048">2048 (±16g)</option>
+      </select>
+    </label>
+    <span id="status" class="live warn">Not connected</span>
+  </div>
+
+  <div class="card">
+    <h3>Live values</h3>
+    <div class="kv mono">
+      <div>EMA (m/s²)</div><div id="kvEMA">–</div>
+      <div>X / Y / Z (m/s²)</div><div id="kvXYZ">–</div>
+      <div>|a| (m/s²)</div><div id="kvMag">–</div>
+      <div>Last line</div><div id="kvLine" class="muted">–</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Visualization</h3>
+    <div class="charts">
+      <div>
+        <div class="legend"><b>Chart A:</b> |a| and EMA (m/s²)</div>
+        <canvas id="chartMag"></canvas>
+      </div>
+      <div>
+        <div class="legend"><b>Chart B:</b> X / Y / Z (m/s²)</div>
+        <canvas id="chartXYZ"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { Detector } from "./pkg/accel_wasm.js";
+
+    // ---------- UI ----------
+    const $ = (id) => document.getElementById(id);
+    const connectBtn = $("connectBtn");
+    const disconnectBtn = $("disconnectBtn");
+    const statusEl = $("status");
+    const baudSel = $("baud");
+    const grSel = $("grange");
+    const kvEMA = $("kvEMA");
+    const kvXYZ = $("kvXYZ");
+    const kvMag = $("kvMag");
+    const kvLine = $("kvLine");
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = `live ${cls || ""}`;
+    }
+
+    // ---------- Canvas helpers ----------
+    function setupHiDPICanvas(canvas) {
+      const dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return ctx;
+    }
+
+    class StripChart {
+      constructor(canvas, series, yRange) {
+        this.canvas = canvas;
+        this.ctx = setupHiDPICanvas(canvas);
+        this.series = series;  // [{name, color, data: Float64Array, head, visible}]
+        this.capacity = 600;   // samples stored
+        this.yMin = yRange?.min ?? 0;
+        this.yMax = yRange?.max ?? 20; // default ~2g
+        this._raf = null;
+        this._needsRedraw = true;
+        window.addEventListener("resize", () => {
+          this.ctx = setupHiDPICanvas(canvas);
+          this._needsRedraw = true;
+          this.draw();
+        });
+      }
+      push(values) {
+        // values is array aligned to series
+        for (let i = 0; i < this.series.length; i++) {
+          const s = this.series[i];
+          if (!s.data) {
+            s.data = new Float64Array(this.capacity);
+            s.head = 0;
+          }
+          s.data[s.head % this.capacity] = values[i] ?? 0;
+        }
+        // advance head once (all share same head)
+        this.series[0].head = (this.series[0].head + 1) % this.capacity;
+        for (let i = 1; i < this.series.length; i++) this.series[i].head = this.series[0].head;
+        this._needsRedraw = true;
+      }
+      autoscale(pad = 0.1) {
+        let lo = +Infinity, hi = -Infinity;
+        for (const s of this.series) {
+          if (!s.visible) continue;
+          const arr = s.data; if (!arr) continue;
+          for (let i = 0; i < arr.length; i++) {
+            const v = arr[i];
+            if (!Number.isFinite(v)) continue;
+            if (v < lo) lo = v;
+            if (v > hi) hi = v;
+          }
+        }
+        if (lo === +Infinity) return;
+        const span = Math.max(1e-6, hi - lo);
+        this.yMin = lo - span * pad;
+        this.yMax = hi + span * pad;
+        this._needsRedraw = true;
+      }
+      draw() {
+        if (!this._needsRedraw) return;
+        const { ctx, canvas } = this;
+        const W = canvas.clientWidth, H = canvas.clientHeight;
+        ctx.clearRect(0, 0, W, H);
+
+        // grid
+        ctx.save();
+        ctx.strokeStyle = "#eee";
+        ctx.lineWidth = 1;
+        for (let i = 1; i < 5; i++) {
+          const y = (H * i) / 5;
+          ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+        }
+        ctx.restore();
+
+        const head = this.series[0].head ?? 0;
+        const cap  = this.capacity;
+        const xStep = W / (cap - 1);
+        const toY = (v) => {
+          const t = (v - this.yMin) / (this.yMax - this.yMin);
+          return H - t * H;
+        };
+
+        for (const s of this.series) {
+          if (s.visible === false) continue;
+          const arr = s.data; if (!arr) continue;
+
+          ctx.beginPath();
+          ctx.lineWidth = 2;
+          ctx.strokeStyle = s.color;
+          // ring buffer draw
+          for (let i = 0; i < cap; i++) {
+            const idx = (head + i + 1) % cap;
+            const x = i * xStep;
+            const y = toY(arr[idx]);
+            if (i === 0) ctx.moveTo(x, y);
+            else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+
+        // y-axis min/max
+        ctx.fillStyle = "#666";
+        ctx.font = "12px system-ui, -apple-system, Segoe UI, Roboto, Arial";
+        ctx.fillText(this.yMax.toFixed(1), 6, 12);
+        ctx.fillText(this.yMin.toFixed(1), 6, H - 6);
+
+        this._needsRedraw = false;
+      }
+      start() {
+        const tick = () => {
+          this._raf = requestAnimationFrame(tick);
+          this.draw();
+        };
+        if (!this._raf) this._raf = requestAnimationFrame(tick);
+      }
+      stop() { if (this._raf) cancelAnimationFrame(this._raf); this._raf = null; }
+    }
+
+    // ---------- Charts ----------
+    const chartMag = new StripChart(
+      document.getElementById("chartMag"),
+      [
+        { name: "|a|",  color: "#2563eb", visible: true },   // blue
+        { name: "EMA",  color: "#dc2626", visible: true },   // red
+      ],
+      { min: 0, max: 20 }
+    );
+    const chartXYZ = new StripChart(
+      document.getElementById("chartXYZ"),
+      [
+        { name: "ax", color: "#0d9488", visible: true }, // teal
+        { name: "ay", color: "#7c3aed", visible: true }, // purple
+        { name: "az", color: "#f59e0b", visible: true }, // amber
+      ],
+      { min: -20, max: 20 }
+    );
+    chartMag.start();
+    chartXYZ.start();
+
+    // ---------- WASM + Serial ----------
+    await init();
+    // alpha=0.10, threshold=0.5 m/s² (~0.05g)
+    const det = new Detector(0.10, 0.5);
+
+    let port = null, reader = null;
+
+    connectBtn.addEventListener("click", onConnect);
+    disconnectBtn.addEventListener("click", onDisconnect);
+
+    if (!("serial" in navigator)) {
+      setStatus("Web Serial not supported (use Chrome/Edge on localhost)", "err");
+      connectBtn.disabled = true;
+    } else {
+      setStatus("Not connected", "warn");
+    }
+
+    class LineBreakTransformer {
+      constructor(){ this.buf = ""; }
+      transform(chunk, ctl) {
+        this.buf += chunk;
+        const lines = this.buf.split(/\r?\n/);
+        this.buf = lines.pop();
+        for (const l of lines) ctl.enqueue(l);
+      }
+      flush(ctl){ if (this.buf) ctl.enqueue(this.buf); }
+    }
+
+    async function onConnect() {
+      try {
+        setStatus("Requesting device…", "warn");
+        port = await navigator.serial.requestPort();
+        const baudRate = parseInt(baudSel.value, 10) || 115200;
+        await port.open({ baudRate });
+        await port.setSignals({ dataTerminalReady: true, requestToSend: false }).catch(()=>{});
+        try {
+          const w = port.writable?.getWriter();
+          if (w) { await w.write(new TextEncoder().encode("\n")); w.releaseLock(); }
+        } catch {}
+        setStatus(`Connected @ ${baudRate} baud`, "ok");
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+
+        // line reader
+        const dec = new TextDecoderStream();
+        port.readable.pipeTo(dec.writable).catch(()=>{});
+        const lineStream = dec.readable.pipeThrough(new TransformStream(new LineBreakTransformer()));
+        reader = lineStream.getReader();
+
+        // If no lines in 2s, fallback to raw bytes
+        let gotLine = false;
+        const watchdog = setTimeout(()=>{ if (!gotLine) { try{ reader.cancel(); }catch{} rawMode(); } }, 2000);
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          gotLine = true;
+          processLine(value.trim());
+        }
+        clearTimeout(watchdog);
+      } catch (e) {
+        setStatus(`Connect failed: ${e.message || e}`, "err");
+        try { await port?.close(); } catch {}
+        port = null;
+      }
+    }
+
+    async function rawMode() {
+      reader = port.readable.getReader();
+      const td = new TextDecoder();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (!value) continue;
+          const text = td.decode(value, { stream: true });
+          for (const line of text.split(/\r?\n/)) {
+            if (line.trim()) processLine(line.trim());
+          }
+        }
+      } catch {}
+    }
+
+    function processLine(s) {
+      if (!s) return;
+      kvLine.textContent = s;
+
+      // Ignore buttons
+      if (s.startsWith("[*button")) return;
+
+      // [*accel <id> <seq> <scale> <x> <y> <z> ...]
+      if (s.startsWith("[*accel")) {
+        const parts = s.replace(/^\[/, "").replace(/\]$/, "").trim().split(/\s+/);
+        if (parts.length < 7) return;
+
+        const scale = parts[3].toLowerCase();
+        let gRange;
+        if (scale === "2g") gRange = 16384;
+        else if (scale === "4g") gRange = 8192;
+        else if (scale === "8g") gRange = 4096;
+        else if (scale === "16g") gRange = 2048;
+        else gRange = parseInt(grSel.value, 10) || 16384;
+
+        const x = parseInt(parts[4], 10);
+        const y = parseInt(parts[5], 10);
+        const z = parseInt(parts[6], 10);
+        if ([x,y,z].some(Number.isNaN)) return;
+
+        const out = Array.from(det.process_counts(x, y, z, gRange));
+        const ax = out[0], ay = out[1], az = out[2];
+        const mag = out[3], ema = out[4], alarm = !!out[5];
+
+        // Live readout
+        kvXYZ.textContent = `${ax.toFixed(3)}, ${ay.toFixed(3)}, ${az.toFixed(3)}`;
+        kvMag.textContent = `${mag.toFixed(3)}`;
+        kvEMA.textContent = `${ema.toFixed(3)}`;
+        setStatus(alarm ? "Connected (ALARM)" : "Connected", alarm ? "err" : "ok");
+
+        // Push to charts
+        chartMag.push([mag, ema]);
+        chartXYZ.push([ax, ay, az]);
+
+        // Optional autoscale (comment out to fix range)
+        chartMag.autoscale(0.15);
+        chartXYZ.autoscale(0.15);
+        return;
+      }
+
+      // CSV fallback: x,y,z[,g_range]
+      if (s.includes(",")) {
+        const p = s.split(",").map(t=>t.trim());
+        let x = parseInt(p[0],10), y = parseInt(p[1],10), z = parseInt(p[2],10);
+        let gRange = p.length >= 4 ? parseInt(p[3],10) : (parseInt(grSel.value,10) || 16384);
+        if ([x,y,z].some(Number.isNaN)) return;
+
+        const out = Array.from(det.process_counts(x, y, z, gRange));
+        const ax = out[0], ay = out[1], az = out[2];
+        const mag = out[3], ema = out[4], alarm = !!out[5];
+
+        kvXYZ.textContent = `${ax.toFixed(3)}, ${ay.toFixed(3)}, ${az.toFixed(3)}`;
+        kvMag.textContent = `${mag.toFixed(3)}`;
+        kvEMA.textContent = `${ema.toFixed(3)}`;
+        setStatus(alarm ? "Connected (ALARM)" : "Connected", alarm ? "err" : "ok");
+
+        chartMag.push([mag, ema]);
+        chartXYZ.push([ax, ay, az]);
+        chartMag.autoscale(0.15);
+        chartXYZ.autoscale(0.15);
+      }
+    }
+
+    async function onDisconnect() {
+      setStatus("Disconnecting…", "warn");
+      try { await reader?.cancel(); } catch {}
+      try { reader?.releaseLock(); } catch {}
+      try { await port?.close(); } catch {}
+      port = null; reader = null;
+      connectBtn.disabled = false; disconnectBtn.disabled = true;
+      setStatus("Disconnected", "warn");
+    }
+
+    window.addEventListener("beforeunload", async () => {
+      try { await reader?.cancel(); } catch {}
+      try { await port?.close(); } catch {}
+    });
+  </script>
+</body>
+</html>
