@@ -4,6 +4,20 @@ import os
 import mimetypes
 from flask import Flask, send_from_directory, abort, jsonify
 from serial.tools import list_ports
+from flask import Response, jsonify, request
+import httpx
+import threading
+from elevenlabs.client import ElevenLabs
+from elevenlabs.play import play  # <-- import the function from the module
+import time
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Simple in-memory cache (text -> (bytes, expiry))
+_TTS_CACHE = {}
+_TTS_LOCK = threading.Lock()
+_TTS_TTL_SEC = 60  # cache identical phrases for 60s
 
 # Ensure correct MIME type for .wasm
 mimetypes.add_type("application/wasm", ".wasm")
@@ -48,6 +62,42 @@ def create_app(web_root: str):
 
     return app
 
+@app.route("/speak-motion")
+def speak_motion():
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        return jsonify({"error": "Missing ELEVENLABS_API_KEY in .env"}), 500
+
+    text = request.args.get("text", "Motion detected. Theft Alert! Theft Alert!")
+    voice_id = request.args.get("voice_id", "JBFqnCBsd6RMkjVDRZzb")  # sample voice
+    model_id = request.args.get("model_id", "eleven_multilingual_v2")
+    output_format = request.args.get("fmt", "mp3_44100_128")
+
+    now = time.time()
+    with _TTS_LOCK:
+        hit = _TTS_CACHE.get((text, voice_id, model_id, output_format))
+        if hit and hit[1] > now:
+            return Response(hit[0], mimetype="audio/mpeg")
+
+    try:
+        client = ElevenLabs(api_key=api_key)
+        # SDK returns an iterator of audio chunks — buffer it to bytes.
+        stream = client.text_to_speech.convert(
+            text=text,
+            voice_id=voice_id,
+            model_id=model_id,
+            output_format=output_format,
+        )
+        audio_bytes = b"".join(stream)
+
+        with _TTS_LOCK:
+            _TTS_CACHE[(text, voice_id, model_id, output_format)] = (audio_bytes, now + _TTS_TTL_SEC)
+
+        return Response(audio_bytes, mimetype="audio/mpeg")
+    except Exception as e:
+        # Log the real error server-side; keep the client message short.
+        print("ElevenLabs TTS error:", repr(e))
+        return jsonify({"error": "TTS failed"}), 500
 
 def main():
     parser = argparse.ArgumentParser(description="Static server for WASM (no serial).")
