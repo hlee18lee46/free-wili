@@ -1,7 +1,5 @@
 python -m serial.tools.miniterm /dev/cu.usbmodem1133101 115200 --raw
 
-python -m serial.tools.miniterm /dev/cu.usbmodem1133101 115200 --raw
-
 /dev/cu.usbmodem1133201
 
 Main Menu
@@ -64,5 +62,7 @@ Building Rust & run WASM app
 
 cd accel_wasm
 wasm-pack build --release --target web -d web/pkg
-
 python app.py --port 7001 --web-root web
+
+
+
