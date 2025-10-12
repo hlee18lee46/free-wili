@@ -100,7 +100,7 @@
 function setMotion(active) {
   const el = document.getElementById("motionStatus");
   if (active) {
-    el.textContent = "Motion Detected. Theft Alert! Theft Alert!";
+    el.textContent = "Motion Detected. Theft Alert!";
     el.className = "live err";
   } else {
     el.textContent = "No motion";
@@ -114,7 +114,7 @@ async function speakMotion() {
   if (now - lastSpeech < 2000) return; // 2-second cooldown
   lastSpeech = now;
 
-  const audio = new Audio("/speak-motion?text=" + encodeURIComponent("Motion detected. Theft Alert! Theft Alert!"));
+  const audio = new Audio("/speak-motion?text=" + encodeURIComponent("Motion detected. Theft Alert!"));
   audio.play();
 }
 
@@ -251,7 +251,7 @@ class StripChart {
     // ---------- WASM + Serial ----------
     await init();
     // alpha=0.10, threshold=0.5 m/s² (~0.05g)
-    const det = new Detector(0.10, 1.0);
+    const det = new Detector(0.10, 1.5);
 
     let port = null, reader = null;
 
@@ -368,7 +368,7 @@ kvEMA.textContent = `${ema.toFixed(3)}`;
 setStatus(alarm ? "Connected (ALARM)" : "Connected", alarm ? "err" : "ok");
 
 // Motion detection threshold ±0.5 m/s²
-const motion = (Math.abs(ax) > 1.0) || (Math.abs(ay) > 1.0);
+const motion = (Math.abs(ax) > 1.5) || (Math.abs(ay) > 1.5);
 setMotion(motion);
 if (motion) speakMotion();
 
