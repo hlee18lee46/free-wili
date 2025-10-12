@@ -13,6 +13,12 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
+from typing import Optional
+import cv2
+from pathlib import Path
+_MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "media")).resolve()
+_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -124,6 +130,80 @@ def _safe_path(root, path):
         abort(403)
     return full
 
+def _open_camera() -> Optional[cv2.VideoCapture]:
+    # Use AVFoundation only on the main thread (macOS quirk)
+    if threading.current_thread().name == "MainThread":
+        cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
+        if cap is not None and cap.isOpened():
+            return cap
+        if cap: cap.release()
+
+    # Fallback: generic backend (works well in background threads)
+    cap = cv2.VideoCapture(0)
+    if cap is not None and cap.isOpened():
+        return cap
+    if cap: cap.release()
+    return None
+
+
+def _capture_photo_async(event_id: str, user_id: Optional[str]) -> None:
+    """
+    Background task: open camera, grab one frame, write JPEG,
+    and update the event doc with photo metadata.
+    """
+    filename = None
+    try:
+        cap = _open_camera()
+        if not cap:
+            raise RuntimeError("Camera not available")
+
+        # Warm-up frames (some cameras need a moment to adjust)
+        for _ in range(3):
+            cap.read()
+
+        ok, frame = cap.read()
+        cap.release()
+
+        if not ok or frame is None:
+            raise RuntimeError("Failed to read frame")
+
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"{ts}_{event_id}.jpg"
+        filepath = _MEDIA_DIR / filename
+
+        # Write JPEG
+        ok = cv2.imwrite(str(filepath), frame)
+        if not ok:
+            raise RuntimeError("Failed to write JPEG")
+
+        # Update Mongo event with photo info
+        try:
+            coll = _mongo_events()
+            coll.update_one(
+                {"_id": event_id},
+                {
+                    "$set": {
+                        "photo_filename": filename,
+                        "photo_path": str(filepath),
+                        "photo_url": f"/media/{filename}",
+                        "photo_saved_at": datetime.now(timezone.utc),
+                    }
+                },
+            )
+        except Exception as e:
+            print("Mongo update after photo capture failed:", repr(e))
+    except Exception as e:
+        print("Camera/photo error:", repr(e))
+        # Best-effort: annotate event as failed to capture (if event exists)
+        try:
+            coll = _mongo_events()
+            coll.update_one(
+                {"_id": event_id},
+                {"$set": {"photo_error": str(e)}}
+            )
+        except Exception:
+            pass
+
 
 def create_app(web_root: str):
     """Factory to create a Flask app bound to a specific web root."""
@@ -151,7 +231,16 @@ def create_app(web_root: str):
                 "hwid": p.hwid,
             })
         return jsonify(ports)
-
+    
+    @app.route("/media/<path:fname>")
+    def serve_media(fname):
+        # prevent path traversal
+        safe = os.path.basename(fname)
+        full = _MEDIA_DIR / safe
+        if not full.exists():
+            abort(404)
+        return send_from_directory(str(_MEDIA_DIR), safe)
+    
     return app
 
 
@@ -162,18 +251,60 @@ def speak_motion():
         return jsonify({"error": "Missing ELEVENLABS_API_KEY in .env"}), 500
 
     text = request.args.get("text", "Motion detected. Theft Alert! Theft Alert!")
-    voice_id = request.args.get("voice_id", "JBFqnCBsd6RMkjVDRZzb")  # sample voice
+    voice_id = request.args.get("voice_id", "JBFqnCBsd6RMkjVDRZzb")
     model_id = request.args.get("model_id", "eleven_multilingual_v2")
     output_format = request.args.get("fmt", "mp3_44100_128")
 
-    # Try to generate audio first; log result either way.
+    # Determine user scope (if any) for the event
+    user_id = _derive_user_id_from_request()
+    event_id = str(uuid.uuid4())
+
+    # Pre-insert an event doc so we can attach photo later
     try:
-        # Cache hit?
+        coll = _mongo_events()
+        pre_doc = {
+            "_id": event_id,
+            "user_id": user_id,
+            "source": "speak-motion",
+            "text": text,
+            "voice_id": voice_id,
+            "model_id": model_id,
+            "output_format": output_format,
+            "success": None,          # unknown yet
+            "error": None,
+            "ip": request.headers.get("x-forwarded-for", request.remote_addr),
+            "user_agent": request.headers.get("user-agent"),
+            "created_at": datetime.now(timezone.utc),
+        }
+        coll.insert_one(pre_doc)
+    except Exception as e:
+        print("Event pre-insert error:", repr(e))
+
+    # Kick off photo capture in the background
+    try:
+        threading.Thread(
+            target=_capture_photo_async,
+            args=(event_id, user_id),
+            daemon=True
+        ).start()
+    except Exception as e:
+        print("Failed to start photo thread:", repr(e))
+        try:
+            _mongo_events().update_one({"_id": event_id}, {"$set": {"photo_error": str(e)}})
+        except Exception:
+            pass
+
+    # TTS response (cache-aware)
+    try:
         now = time.time()
         with _TTS_LOCK:
             hit = _TTS_CACHE.get((text, voice_id, model_id, output_format))
             if hit and hit[1] > now:
-                _log_motion_event(text, voice_id, model_id, output_format, ok=True, err=None)
+                # Mark event success and return cached audio
+                try:
+                    _mongo_events().update_one({"_id": event_id}, {"$set": {"success": True, "error": None}})
+                except Exception:
+                    pass
                 return Response(hit[0], mimetype="audio/mpeg")
 
         client = ElevenLabs(api_key=api_key)
@@ -188,13 +319,19 @@ def speak_motion():
         with _TTS_LOCK:
             _TTS_CACHE[(text, voice_id, model_id, output_format)] = (audio_bytes, now + _TTS_TTL_SEC)
 
-        _log_motion_event(text, voice_id, model_id, output_format, ok=True, err=None)
+        try:
+            _mongo_events().update_one({"_id": event_id}, {"$set": {"success": True, "error": None}})
+        except Exception:
+            pass
+
         return Response(audio_bytes, mimetype="audio/mpeg")
     except Exception as e:
         print("ElevenLabs TTS error:", repr(e))
-        _log_motion_event(text, voice_id, model_id, output_format, ok=False, err=str(e))
+        try:
+            _mongo_events().update_one({"_id": event_id}, {"$set": {"success": False, "error": str(e)}})
+        except Exception:
+            pass
         return jsonify({"error": "TTS failed"}), 500
-
 
 def main():
     parser = argparse.ArgumentParser(description="Static server for WASM (no serial).")
@@ -211,6 +348,20 @@ def main():
     app_instance = create_app(web_root)
     app_instance.run(host=args.host, port=args.port, debug=False)
 
+@app.route("/events/latest")
+def events_latest():
+    try:
+        coll = _mongo_events()
+        doc = coll.find().sort("created_at", -1).limit(1).next()
+    except Exception:
+        return jsonify({"ok": False, "error": "No events yet"}), 404
+
+    # make it JSON-friendly
+    doc["_id"] = str(doc["_id"])
+    for k in ("created_at", "photo_saved_at"):
+        if doc.get(k):
+            doc[k] = doc[k].isoformat()
+    return jsonify({"ok": True, "event": doc})
 
 if __name__ == "__main__":
     main()
